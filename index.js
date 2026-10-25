@@ -106,17 +106,17 @@ function writeCoreConfig() {
   return p;
 }
 
-function run(name, cmd, args, restartMs = 5000) {
-  const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+function run(name, cmd, args, restartMs = 5000, extraEnv = null) {
+  const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], env: extraEnv ? { ...process.env, ...extraEnv } : process.env });
   child.stdout.on('data', d => process.stdout.write(`[${name}] ${d}`));
   child.stderr.on('data', d => process.stderr.write(`[${name}] ${d}`));
   child.on('exit', (code) => {
     log(`${name} exited (${code}), restarting in ${restartMs}ms`);
-    setTimeout(() => run(name, cmd, args, restartMs), restartMs);
+    setTimeout(() => run(name, cmd, args, restartMs, extraEnv), restartMs);
   });
   child.on('error', (e) => {
     log(`${name} spawn error:`, e.message);
-    setTimeout(() => run(name, cmd, args, restartMs), restartMs);
+    setTimeout(() => run(name, cmd, args, restartMs, extraEnv), restartMs);
   });
   return child;
 }
@@ -164,7 +164,15 @@ async function main() {
         }
         if (fs.existsSync(nz)) {
           fs.chmodSync(nz, 0o755);
-          run('nezha', nz, ['-s', NEZHA_SERVER, '-p', NEZHA_KEY, '--tls']);
+          // v1.14.0 agent has no -s/-p flags (it is config/env based);
+          // the old flags made it exit every 5s. Use NZ_* env vars instead.
+          // UUID is a valid UUID (the VLESS id), which v1 requires.
+          const tls = /:(443|8443|2096|2087|2083|2053)$/.test(NEZHA_SERVER) ? 'true' : 'false';
+          run('nezha', nz, [], 5000, {
+            NZ_SERVER: NEZHA_SERVER, NZ_CLIENT_SECRET: NEZHA_KEY, NZ_TLS: tls,
+            NZ_UUID: UUID, NZ_REPORT_DELAY: '4', NZ_DISABLE_AUTO_UPDATE: 'true',
+            NZ_SKIP_CONNECTION_COUNT: 'true', NZ_SKIP_PROCS_COUNT: 'true',
+          });
         }
       } catch (e) { log('nezha setup failed (non-fatal):', e.message); }
     }
