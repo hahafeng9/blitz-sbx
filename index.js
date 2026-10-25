@@ -3,9 +3,11 @@
  *
  * How it works:
  *  - A plain HTTP server listens on $PORT (Blitz default 8080) for health checks.
- *  - At startup it downloads sing-box and cloudflared (linux amd64) into ./bin,
- *    writes a sing-box config from env vars, and runs both.
- *  - sing-box listens only on 127.0.0.1:SBX_PORT with VLESS+WS at WS_PATH.
+ *  - At startup it downloads xray-core and cloudflared (linux amd64) into ./bin,
+ *    writes an xray config from env vars, and runs both.
+ *    (v1 used sing-box, but sing-box died at "start service" in the Blitz
+ *    sandbox with no config detail, so the core was switched to xray.)
+ *  - xray listens only on 127.0.0.1:SBX_PORT with VLESS+WS at WS_PATH.
  *  - cloudflared connects outbound with ARGO_AUTH and serves ARGO_DOMAIN,
  *    so the fixed tunnel hostname is the only public entry point.
  *  - Nezha agent is optional: set NEZHA_SERVER and NEZHA_KEY to enable it.
@@ -14,7 +16,7 @@
  *  UUID         - VLESS user id (required for a stable node link)
  *  NAME         - node display name, default "blitz"
  *  WS_PATH      - WebSocket path, default "/blitz-ws"
- *  SBX_PORT     - sing-box local port, default 18000
+ *  SBX_PORT     - core local port, default 18000
  *  ARGO_DOMAIN  - fixed tunnel hostname, e.g. blitz.fengco.tech
  *  ARGO_AUTH    - Cloudflare tunnel token for that hostname
  *  NEZHA_SERVER - Nezha panel, e.g. nezha2026.5785787.xyz:443
@@ -42,7 +44,7 @@ const NEZHA_KEY = process.env.NEZHA_KEY || '';
 const SUB_TOKEN = process.env.SUB_TOKEN || '';
 
 const BIN = path.join(__dirname, 'bin');
-const SBX_VER = '1.12.12';
+const XRAY_VER = '26.10.21';
 const CFD_VER = '2026.10.3';
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
@@ -72,33 +74,32 @@ function download(url, dest) {
 
 function ensureBinaries() {
   fs.mkdirSync(BIN, { recursive: true });
-  // sing-box
-  const sbx = path.join(BIN, 'sing-box');
-  if (!fs.existsSync(sbx)) {
-    const tgz = path.join(BIN, 'sing-box.tgz');
-    download(`https://github.com/SagerNet/sing-box/releases/download/v${SBX_VER}/sing-box-${SBX_VER}-linux-amd64.tar.gz`, tgz);
-    sh(`tar -xzf ${tgz} -C ${BIN} --strip-components=1 sing-box-${SBX_VER}-linux-amd64/sing-box && rm -f ${tgz}`);
+  // xray-core (zip, needs unzip from the Dockerfile)
+  const core = path.join(BIN, 'xray');
+  if (!fs.existsSync(core)) {
+    const zip = path.join(BIN, 'xray.zip');
+    download(`https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/Xray-linux-64.zip`, zip);
+    sh(`cd ${BIN} && unzip -o xray.zip xray && rm -f xray.zip`);
   }
-  fs.chmodSync(sbx, 0o755);
+  fs.chmodSync(core, 0o755);
   // cloudflared
   const cfd = path.join(BIN, 'cloudflared');
   if (!fs.existsSync(cfd)) {
     download(`https://github.com/cloudflare/cloudflared/releases/download/${CFD_VER}/cloudflared-linux-amd64`, cfd);
   }
   fs.chmodSync(cfd, 0o755);
-  return { sbx, cfd };
+  return { core, cfd };
 }
 
-function writeSbxConfig() {
+function writeCoreConfig() {
   const cfg = {
-    log: { level: 'info' },
+    log: { loglevel: 'info' },
     inbounds: [{
-      type: 'vless', tag: 'vless-ws',
-      listen: '127.0.0.1', listen_port: SBX_PORT,
-      users: [{ uuid: UUID, flow: '' }],
-      transport: { type: 'ws', path: WS_PATH },
+      port: SBX_PORT, listen: '127.0.0.1', protocol: 'vless',
+      settings: { clients: [{ id: UUID }], decryption: 'none' },
+      streamSettings: { network: 'ws', wsSettings: { path: WS_PATH } },
     }],
-    outbounds: [{ type: 'direct', tag: 'direct' }],
+    outbounds: [{ protocol: 'freedom', tag: 'direct' }],
   };
   const p = path.join(BIN, 'config.json');
   fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
@@ -144,9 +145,9 @@ async function main() {
   server.listen(PORT, () => log(`http listening on ${PORT}`));
 
   try {
-    const { sbx, cfd } = ensureBinaries();
-    const cfg = writeSbxConfig();
-    run('sing-box', sbx, ['run', '-c', cfg]);
+    const { core, cfd } = ensureBinaries();
+    const cfg = writeCoreConfig();
+    run('xray', core, ['run', '-c', cfg]);
     if (ARGO_AUTH && ARGO_DOMAIN) {
       run('cloudflared', cfd, ['tunnel', '--no-autoupdate', 'run', '--token', ARGO_AUTH]);
       log(`fixed tunnel: ${ARGO_DOMAIN} -> 127.0.0.1:${SBX_PORT} ${WS_PATH}`);
