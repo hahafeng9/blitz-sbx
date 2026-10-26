@@ -1,47 +1,66 @@
 /**
  * blitz-sbx - a clean, small VLESS+WS node for Blitz (and any Node PaaS).
  *
- * How it works:
- *  - A plain HTTP server listens on $PORT (Blitz default 8080) for health checks.
+ * Blitz port rule (blitz.cloud/docs, 2026-09-26 / 2026-10-19):
+ *  - An app serves HTTP on ONE TCP port. Blitz tells the app to listen on
+ *    8080 through the PORT env var; a Dockerfile EXPOSE other than 8080 is
+ *    read from the image and used instead. A background app gets no address
+ *    and no port at all from Blitz.
+ *  - v3 broke this rule in practice: Node owned $PORT (8080) for health
+ *    checks while xray listened on a second, undeclared port 18000, and
+ *    cloudflared dialled 127.0.0.1:18000. The app stayed Online and the
+ *    tunnel stayed connected, but every public request to the tunnel
+ *    returned an empty reply - the second port was never reachable.
+ *    Local xray on the same config answers plain GET with 400 and a WS
+ *    upgrade with 101, so the tunnel path, not xray, was the break.
+ *  - v4 fix: xray itself owns the one supported port, $PORT (default
+ *    8080, EXPOSE 8080 in the Dockerfile). There is no second HTTP server
+ *    and no second port. cloudflared dials 127.0.0.1:$PORT, the tunnel
+ *    ingress must point at the same $PORT. The /sub endpoint is dropped
+ *    with the health server; the node link is deterministic from env
+ *    (see below), so nothing needs to scrape the app for it.
+ *
+ * How it works (v4):
  *  - At startup it downloads xray-core and cloudflared (linux amd64) into ./bin,
  *    writes an xray config from env vars, and runs both.
  *    (v1 used sing-box, but sing-box died at "start service" in the Blitz
  *    sandbox with no config detail, so the core was switched to xray.)
- *  - xray listens only on 127.0.0.1:SBX_PORT with VLESS+WS at WS_PATH.
+ *  - xray listens only on 127.0.0.1:$PORT with VLESS+WS at WS_PATH.
  *  - cloudflared connects outbound with ARGO_AUTH and serves ARGO_DOMAIN,
  *    so the fixed tunnel hostname is the only public entry point.
  *  - Nezha agent is optional: set NEZHA_SERVER and NEZHA_KEY to enable it.
+ *    (v1.14.0 has no -s/-p flags; it is started with NZ_* env vars.)
  *
  * Env vars (set in the Blitz dashboard, never in this repo):
  *  UUID         - VLESS user id (required for a stable node link)
  *  NAME         - node display name, default "blitz"
  *  WS_PATH      - WebSocket path, default "/blitz-ws"
- *  SBX_PORT     - core local port, default 18000
  *  ARGO_DOMAIN  - fixed tunnel hostname, e.g. blitz.fengco.tech
  *  ARGO_AUTH    - Cloudflare tunnel token for that hostname
  *  NEZHA_SERVER - Nezha panel, e.g. nezha2026.5785787.xyz:443
  *  NEZHA_KEY    - Nezha client secret
- *  SUB_TOKEN    - optional token required as ?token= to read /sub
+ *  PORT         - the one supported port, set by Blitz (default 8080).
+ *                 SBX_PORT is intentionally ignored in v4; do not set it.
  *
  * The node link is deterministic from the env above, so the deployer can
- * build it without scraping the app: 
+ * build it without scraping the app:
  * vless://UUID@ARGO_DOMAIN:443?encryption=none&security=tls&sni=ARGO_DOMAIN&type=ws&host=ARGO_DOMAIN&path=WS_PATH#NAME
  */
-const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn, execSync } = require('child_process');
 const crypto = require('crypto');
 
+// The ONE supported port. Blitz sets PORT=8080; background apps may not
+// set it at all, hence the same 8080 default. Do not add a second port.
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const SBX_PORT = parseInt(process.env.SBX_PORT || '18000', 10);
+const SBX_PORT = PORT;
 const WS_PATH = process.env.WS_PATH || '/blitz-ws';
 const NAME = process.env.NAME || 'blitz';
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || '';
 const ARGO_AUTH = process.env.ARGO_AUTH || '';
 const NEZHA_SERVER = process.env.NEZHA_SERVER || '';
 const NEZHA_KEY = process.env.NEZHA_KEY || '';
-const SUB_TOKEN = process.env.SUB_TOKEN || '';
 
 const BIN = path.join(__dirname, 'bin');
 const XRAY_VER = '26.10.21';
@@ -128,21 +147,11 @@ function nodeLink() {
 }
 
 async function main() {
-  // Health / info server first, so Blitz sees the app up even while binaries download.
-  const server = http.createServer((req, res) => {
-    const u = new URL(req.url, 'http://localhost');
-    if (u.pathname === '/sub') {
-      if (SUB_TOKEN && u.searchParams.get('token') !== SUB_TOKEN) {
-        res.writeHead(403); res.end('forbidden'); return;
-      }
-      const link = nodeLink();
-      if (!link) { res.writeHead(503); res.end('tunnel not configured'); return; }
-      res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end(link + '\n'); return;
-    }
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(`blitz-sbx ok name=${NAME} ws=${WS_PATH} tunnel=${ARGO_DOMAIN || '(not set)'}\n`);
-  });
-  server.listen(PORT, () => log(`http listening on ${PORT}`));
+  // v4: no separate HTTP server. Blitz supports ONE port per app ($PORT),
+  // and xray owns it. A second server on $PORT would conflict with xray,
+  // and a server on any other port is not the supported port. The node
+  // link is deterministic from env, so no /sub endpoint is needed.
+  log(`single-port mode: xray will own 127.0.0.1:${PORT} ${WS_PATH} (tunnel=${ARGO_DOMAIN || '(not set)'})`);
 
   try {
     const { core, cfd } = ensureBinaries();
@@ -180,7 +189,10 @@ async function main() {
     if (link) log('node link ready (do not paste secrets in logs in production)');
   } catch (e) {
     log('startup failed:', e.message);
-    // Keep the HTTP server up so Blitz reports the app as running and logs are visible.
+    // No HTTP server to keep up in v4; the launcher process itself stays
+    // alive so Blitz reports the app as running and logs stay visible.
+    // Keep the process alive rather than exiting into a crash loop.
+    setInterval(() => {}, 60000);
   }
 }
 
